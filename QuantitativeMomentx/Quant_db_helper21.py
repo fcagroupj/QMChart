@@ -44,6 +44,52 @@ def plot_average_price_line(ma_window, closes, xs, top_margin, plot_h, min_c, ma
 
         cv2.polylines(img, [pts_ma], False, color, 1, lineType=cv2.LINE_AA)    
 
+# Helper: draw title text and return updated image and title box
+def drawTitleBox(img, title: str, left_margin: int = 2):
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import cv2 as _cv
+        H, W = img.shape[0], img.shape[1]
+        font_path = _find_chinese_font()
+        font_size = max(18, min(36, H // 25))
+        font = None
+        if font_path:
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+            except Exception:
+                for idx in range(5):
+                    try:
+                        font = ImageFont.truetype(font_path, font_size, index=idx)
+                        break
+                    except Exception:
+                        continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        rgb = _cv.cvtColor(img, _cv.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(pil_img)
+        bbox = draw.textbbox((0, 0), title, font=font)
+        tw = int(bbox[2] - bbox[0])
+        th = int(bbox[3] - bbox[1])
+        tx = max(left_margin, int((W - tw) / 2))
+        ty = 2
+        draw.text((tx, ty), title, font=font, fill=(255, 255, 255))
+        img = _cv.cvtColor(np.array(pil_img), _cv.COLOR_RGB2BGR)
+        title_box = (tx, ty - th, tx + tw, ty + th)
+        return img, title_box
+    except Exception:
+        # Fallback without PIL
+        H, W = img.shape[0], img.shape[1]
+        font_title = cv2.FONT_HERSHEY_SIMPLEX
+        title_scale = max(0.6, min(1.0, H / 700))
+        (tw, th), _ = cv2.getTextSize(title, font_title, title_scale, 2)
+        tx = max(left_margin, int((W - tw) / 2))
+        ty = th + 2
+        cv2.putText(img, title, (tx, ty), font_title, title_scale, (255, 255, 255), 2, cv2.LINE_AA)
+        title_box = (tx, ty - th, tx + tw, ty)
+        return img, title_box
+
 # Render plot image and metadata from loaded price data
 _LAST_SAVED_VIEW: Optional[Tuple[int, int]] = None
 
@@ -66,6 +112,7 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
     pre_k = price_data.get("k")
     pre_d = price_data.get("d")
     pre_j = price_data.get("j")
+    pre_rsi = price_data.get("rsi14")
     pre_obv = price_data.get("obv")
     pre_obv_ma20 = price_data.get("obv_ma20")
     ma_map = price_data.get("ma")
@@ -94,6 +141,7 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
             pre_k = _slice(pre_k)
             pre_d = _slice(pre_d)
             pre_j = _slice(pre_j)
+            pre_rsi = _slice(pre_rsi)
             volumes = _slice(volumes)
             pre_obv = _slice(pre_obv)
             pre_obv_ma20 = _slice(pre_obv_ma20)
@@ -128,30 +176,37 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
     n = len(closes)
     plot_w = W - left_margin - right_margin
     plot_h_total = H - top_margin - bottom_margin
-    # Decide whether to draw MACD/KDJ/OBV, QM (schema2) and cross markers based on flags
+    # Decide whether to draw MACD/KDJ/OBV, QM (schema2), Volume and cross markers based on flags
     draw_macd = True
     draw_kdj = True
     draw_cross = True
     draw_qm = False
+    draw_rsi = False
     draw_obv = False
+    draw_volume = True
     try:
         if ma_flags is not None:
             draw_macd = bool(ma_flags.get('macd', True))
             draw_kdj = bool(ma_flags.get('kdj', True))
             draw_cross = bool(ma_flags.get('cross', True))
             draw_qm = bool(ma_flags.get('schema2', False))
+            draw_rsi = bool(ma_flags.get('rsi', False))
             draw_obv = bool(ma_flags.get('obv', False))
+            draw_volume = bool(ma_flags.get('volume', True))
     except Exception:
         draw_macd = True
         draw_kdj = True
         draw_cross = True
         draw_qm = False
+        draw_rsi = False
         draw_obv = False
+        draw_volume = True
     # Split into panels: price (top), then dynamic set of subpanels (MACD, KDJ, OBV, QM)
     sep_h = 8
     macd_top = None; macd_bottom = None; macd_h = 0
     kdj_top = None; kdj_bottom = None; kdj_h = 0
     obv_top = None; obv_bottom = None; obv_h = 0
+    rsi_top = None; rsi_bottom = None; rsi_h = 0
     qm_top = None; qm_bottom = None; qm_h = 0
     # Decide default heights for subpanels
     sub_heights = []
@@ -161,6 +216,8 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
         sub_heights.append(('kdj', int(max(60, plot_h_total * 0.22))))
     if draw_obv:
         sub_heights.append(('obv', int(max(60, plot_h_total * 0.22))))
+    if draw_rsi:
+        sub_heights.append(('rsi', int(max(60, plot_h_total * 0.20))))
     if draw_qm:
         sub_heights.append(('qm', int(max(60, plot_h_total * 0.20))))
     total_sub = sum(h for _, h in sub_heights)
@@ -177,6 +234,8 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
             kdj_top, kdj_bottom, kdj_h = top, bottom, h
         elif name == 'obv':
             obv_top, obv_bottom, obv_h = top, bottom, h
+        elif name == 'rsi':
+            rsi_top, rsi_bottom, rsi_h = top, bottom, h
         elif name == 'qm':
             qm_top, qm_bottom, qm_h = top, bottom, h
         y_cursor = bottom
@@ -222,10 +281,11 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
         stock_type = _cfg.get('ts_stock_type', 'cn')
     except Exception:
         stock_type = 'cn'
-    color_up = (0, 0, 200)   # red (CN convention)
-    color_down = (0, 150, 0) # green
+    # Use a light neutral color for the price line
+    color_up = (0, 0, 100)   # red (CN convention)
+    color_down = (0, 100, 0) # green
     if stock_type == 'us':
-        color_up, color_down = (0, 150, 0), (0, 0, 200)
+        color_up, color_down = (0, 100, 0), (0, 0, 100)
     neutral = (150, 150, 150)
     for i in range(1, n):
         c_prev = closes[i-1]
@@ -242,7 +302,36 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
             col = neutral
         cv2.line(img, (x1, y1), (x2, y2), col, 2, lineType=cv2.LINE_AA)
 
-    # --- Schema 3: Divergence flags on MA20 using OBV MA20 ---
+    # Volume cylinders under the price panel (toggleable)
+    if draw_volume:
+        try:
+            vols_arr = np.array(volumes, dtype=float)
+            mask_v = np.isfinite(vols_arr)
+            if np.any(mask_v):
+                max_v = float(np.nanmax(vols_arr[mask_v]))
+                vol_h = int(max(40, price_h * 0.20))
+                y_base = price_bottom - 2
+                dx = (xs[-1] - xs[0]) / (n - 1) if n > 1 else 2.0
+                half_w = max(2, int(dx * 0.35))
+                for i in range(n):
+                    v = vols_arr[i] if np.isfinite(vols_arr[i]) else 0.0
+                    h = int(vol_h * (v / max_v)) if max_v > 0 else 0
+                    x = int(xs[i])
+                    y1 = y_base
+                    y0 = max(price_top + 2, y_base - h)
+                    if i > 0 and np.isfinite(closes[i]) and np.isfinite(closes[i-1]):
+                        color = color_up if closes[i] >= closes[i-1] else color_down
+                    else:
+                        color = neutral
+                    cv2.rectangle(img, (x - half_w, y0), (x + half_w, y1), color, -1)
+                    try:
+                        cv2.ellipse(img, (x, y0), (half_w, max(2, int(half_w * 0.5))), 0, 0, 360, (min(color[0]+105,255), min(color[1]+105,255), min(color[2]+105,255)), -1, lineType=cv2.LINE_AA)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # --- Schema 3: Divergence flags on MA20 using OBV MA20, draw red flags for bearish and green for bullish divergences ---
     try:
         draw_schema3 = bool(ma_flags.get('schema3', False)) if ma_flags is not None else False
     except Exception:
@@ -334,17 +423,198 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
                 last_flag_i = i
                 x = int(xs[i])
                 y = int(y_price(ma20[i]))
-                pole_h = max(10, int(H / 80))
-                y_top = max(price_top + 2, y - pole_h // 2)
-                y_bot = min(price_bottom - 2, y + pole_h // 2)
-                cv2.line(img, (x, y_top), (x, y_bot), (150, 150, 150), 1, lineType=cv2.LINE_AA)
+                pole_h = max(20, int(H / 80))
+                y_top = max(price_top + 8, y - pole_h // 2)
+                y_bot = min(price_bottom - 8, y + pole_h // 2)
+                cv2.line(img, (x, y_top), (x, y_bot), (250, 250, 250), 1, lineType=cv2.LINE_AA)
                 if bearish:
-                    pts = np.array([[x, y_top], [x + 12, y_top + 6], [x, y_top + 12]], dtype=np.int32)
+                    ym = int((y_top + y_bot) / 2)
+                    pts = np.array([[x, ym], [x + 24, ym + 12], [x, ym + 24]], dtype=np.int32)
                     cv2.fillConvexPoly(img, pts, (0, 0, 200), lineType=cv2.LINE_AA)
                 else:
                     ym = int((y_top + y_bot) / 2)
-                    pts = np.array([[x, ym], [x + 12, ym - 6], [x, ym - 12]], dtype=np.int32)
+                    pts = np.array([[x, ym], [x + 24, ym - 12], [x, ym - 24]], dtype=np.int32)
                     cv2.fillConvexPoly(img, pts, (0, 150, 0), lineType=cv2.LINE_AA)
+
+                # Draw a manual arrow line to show the window [i-win, i], aligned to PRICE curve
+                try:
+                    col_flag = (0, 0, 200) if bearish else (0, 150, 0)
+                    start_idx = i - win
+                    # Find earliest finite MA20 inside the window
+                    j = None
+                    for k in range(start_idx, i + 1):
+                        if np.isfinite(closes[k]):
+                            j = k
+                            break
+                    if j is None or not np.isfinite(closes[i]):
+                        raise Exception("close not finite for arrow")
+                    x_start = int(xs[j])
+                    y_start = int(np.clip(float(ys[j]), price_top + 6, price_bottom - 6))
+                    x_end = int(xs[i])
+                    y_end = int(np.clip(float(ys[i]), price_top + 6, price_bottom - 6))
+                    # Draw base line following slope
+                    cv2.line(img, (x_start, y_start), (x_end, y_end), (255, 223, 0), 1, lineType=cv2.LINE_AA)
+                    # Arrow head oriented along segment
+                    dx = float(x_end - x_start)
+                    dy = float(y_end - y_start)
+                    L = float(np.hypot(dx, dy))
+                    if L < 1e-3:
+                        raise Exception("degenerate arrow segment")
+                    ux = dx / L
+                    uy = dy / L
+                    px = -uy
+                    py = ux
+                    head_len = int(max(6.0, min(24.0, L * 0.25))) // 2
+                    head_w = int(max(4.0, min(18.0, head_len * 0.6))) // 2
+                    bx = x_end - int(ux * head_len)
+                    by = y_end - int(uy * head_len)
+                    p1 = (x_end, y_end)
+                    p2 = (bx + int(px * head_w), by + int(py * head_w))
+                    p3 = (bx - int(px * head_w), by - int(py * head_w))
+                    pts_head = np.array([p1, p2, p3], dtype=np.int32)
+                    cv2.fillConvexPoly(img, pts_head, col_flag, lineType=cv2.LINE_AA)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # --- Schema 4: RSI Oversold Bounce ---
+    # Logic:
+    # - Detect when RSI(14) emerges from an oversold state and price confirms a bounce.
+    # - Signal when: RSI[prev] < 30 and RSI[curr] >= 30 and Close[curr] > Close[prev].
+    # - Draw an upward triangle below the price to indicate a potential bottoming bounce.
+    try:
+        draw_schema4 = bool(ma_flags.get('schema4', False)) if ma_flags is not None else False
+    except Exception:
+        draw_schema4 = False
+    if draw_schema4:
+        try:
+            closes_arr = np.array(closes, dtype=float)
+            if n < 2:
+                raise Exception("insufficient data")
+
+            # Prepare RSI(14)
+            if pre_rsi is not None and isinstance(pre_rsi, list) and len(pre_rsi) == n:
+                rsi_arr = np.array(pre_rsi, dtype=float)
+            else:
+                s_close = pd.Series(closes_arr, dtype=float)
+                delta = s_close.diff()
+                gain = delta.clip(lower=0)
+                loss = -delta.clip(upper=0)
+                avg_gain = gain.ewm(alpha=1/14.0, adjust=False).mean()
+                avg_loss = loss.ewm(alpha=1/14.0, adjust=False).mean()
+                rs = avg_gain / avg_loss
+                rsi_arr = (100.0 - (100.0 / (1.0 + rs))).to_numpy()
+
+            # Tunables (with config overrides)
+            try:
+                _cfg = cfg_util.read_config()
+                oversold = float((_cfg.get('schema4_rsi_threshold') or '35'))
+                min_spacing = int((_cfg.get('schema4_min_spacing') or '3'))
+            except Exception:
+                oversold = 35.0
+                min_spacing = 3
+            last_flag_i = -999
+            tri_h = max(12, int((W / max(50, n)) * 0.6))
+            tri_w = tri_h
+
+            for i in range(1, n):
+                r_prev = rsi_arr[i-1]
+                r_curr = rsi_arr[i]
+                c_prev = closes_arr[i-1]
+                c_curr = closes_arr[i]
+                if not (np.isfinite(r_prev) and np.isfinite(r_curr) and np.isfinite(c_prev) and np.isfinite(c_curr)):
+                    continue
+                # Bounce conditions (loosened to draw more signals):
+                # 1) Emerge from oversold
+                crossed_up = (r_prev < oversold) and (r_curr >= oversold)
+                # 2) RSI rising meaningfully while still oversold or near-oversold
+                rising_in_oversold = (r_prev < oversold) and (r_curr > r_prev + 2.0 and r_curr <= oversold + 5.0)
+                # Price confirmation (soft): non-decreasing close
+                price_non_down = c_curr >= c_prev
+                if not ((crossed_up or rising_in_oversold) and price_non_down):
+                    continue
+
+                # Avoid clutter: enforce spacing
+                if i - last_flag_i < min_spacing:
+                    continue
+                last_flag_i = i
+
+                # Draw upward triangle signal under the price point
+                x_day = int(xs[i])
+                y_day = int(ys[i])
+                apex = (x_day, max(price_top + 4, y_day - tri_h))
+                left = (x_day - tri_w , y_day + tri_h )
+                right = (x_day + tri_w , y_day + tri_h )
+                pts_tri = np.array([apex, left, right], dtype=np.int32)
+                cv2.fillConvexPoly(img, pts_tri, (255, 128, 0), lineType=cv2.LINE_AA)
+        except Exception:
+            pass
+
+        # --- Schema 5: RSI Overbought + Reversal (Top flags) ---
+        # Logic:
+        # - Detect when RSI(14) rolls over from overbought and price confirms a reversal.
+        # - Signal when: RSI[prev] > threshold and RSI[curr] <= threshold and Close[curr] <= Close[prev].
+        # - Also allow a stronger rollover inside overbought: RSI drops more than 2 points while still > threshold - 5.
+        # - Draw a downward triangle above the price to indicate potential topping.
+
+        try:
+            closes_arr = np.array(closes, dtype=float)
+            if n < 2:
+                raise Exception("insufficient data")
+
+            # Prepare RSI(14)
+            if pre_rsi is not None and isinstance(pre_rsi, list) and len(pre_rsi) == n:
+                rsi_arr = np.array(pre_rsi, dtype=float)
+            else:
+                s_close = pd.Series(closes_arr, dtype=float)
+                delta = s_close.diff()
+                gain = delta.clip(lower=0)
+                loss = -delta.clip(upper=0)
+                avg_gain = gain.ewm(alpha=1/14.0, adjust=False).mean()
+                avg_loss = loss.ewm(alpha=1/14.0, adjust=False).mean()
+                rs = avg_gain / avg_loss
+                rsi_arr = (100.0 - (100.0 / (1.0 + rs))).to_numpy()
+
+            # Tunables (with config overrides)
+            try:
+                _cfg = cfg_util.read_config()
+                overbought = float((_cfg.get('schema5_rsi_threshold') or '70'))
+                min_spacing_top = int((_cfg.get('schema5_min_spacing') or '4'))
+            except Exception:
+                overbought = 70.0
+                min_spacing_top = 4
+            last_flag_top_i = -999
+            tri_h = max(12, int((W / max(50, n)) * 0.6))
+            tri_w = tri_h
+
+            for i in range(1, n):
+                r_prev = rsi_arr[i-1]
+                r_curr = rsi_arr[i]
+                c_prev = closes_arr[i-1]
+                c_curr = closes_arr[i]
+                if not (np.isfinite(r_prev) and np.isfinite(r_curr) and np.isfinite(c_prev) and np.isfinite(c_curr)):
+                    continue
+                # Reversal conditions:
+                crossed_down = (r_prev > overbought) and (r_curr <= overbought)
+                rollover_in_overbought = (r_prev > overbought) and (r_curr < r_prev - 2.0 and r_curr >= overbought - 5.0)
+                price_non_up = (c_curr <= c_prev)
+                if not ((crossed_down or rollover_in_overbought) and price_non_up):
+                    continue
+
+                # Avoid clutter: enforce spacing
+                if i - last_flag_top_i < min_spacing_top:
+                    continue
+                last_flag_top_i = i
+
+                # Draw downward triangle signal above the price point
+                x_day = int(xs[i])
+                y_day = int(ys[i])
+                apex = (x_day, min(price_bottom - 4, y_day + tri_h))
+                left = (x_day - tri_w , y_day - tri_h )
+                right = (x_day + tri_w , y_day - tri_h )
+                pts_tri = np.array([apex, left, right], dtype=np.int32)
+                cv2.fillConvexPoly(img, pts_tri, (128, 0, 128), lineType=cv2.LINE_AA)
         except Exception:
             pass
 
@@ -402,12 +672,6 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
             # zero line
             cv2.line(img, (left_margin, int(y_zero[0])), (W - right_margin, int(y_zero[0])), (220, 220, 220), 1, lineType=cv2.LINE_AA)
 
-            # DIF and DEA lines
-            pts_dif = np.column_stack((xs, y_dif)).astype(np.int32)
-            pts_dea = np.column_stack((xs, y_dea)).astype(np.int32)
-            cv2.polylines(img, [pts_dif], False, (0, 120, 255), 1, lineType=cv2.LINE_AA)
-            cv2.polylines(img, [pts_dea], False, (255, 120, 0), 1, lineType=cv2.LINE_AA)
-
             # MACD histogram bars
             # approximate bar half-width based on spacing
             if n > 1:
@@ -421,10 +685,16 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
                 y0 = int(y_zero[i])
                 # Mainland convention: red for positive (up), green for negative (down)
                 _cfg = cfg_util.read_config()
-                color_bar = (0, 0, 200) if macd_vals[i] >= 0 else (0, 150, 0)
+                color_bar = (0, 0, 100) if macd_vals[i] >= 0 else (0, 100, 0)
                 if(_cfg.get('ts_stock_type', 'cn') == 'us'):
-                    color_bar = (0, 150, 0) if macd_vals[i] >= 0 else (0, 0, 200)
+                    color_bar = (0, 100, 0) if macd_vals[i] >= 0 else (0, 0, 100)
                 cv2.rectangle(img, (x - half_w, min(y0, y1)), (x + half_w, max(y0, y1)), color_bar, -1)
+
+            # DIF and DEA lines
+            pts_dif = np.column_stack((xs, y_dif)).astype(np.int32)
+            pts_dea = np.column_stack((xs, y_dea)).astype(np.int32)
+            cv2.polylines(img, [pts_dif], False, (0, 120, 255), 1, lineType=cv2.LINE_AA)
+            cv2.polylines(img, [pts_dea], False, (255, 120, 0), 1, lineType=cv2.LINE_AA)
 
             # Draw MACD golden/death cross markers
             try:
@@ -739,54 +1009,9 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
     except Exception:
         pass
 
-    # Title
+    # Title text (drawing moved out to drawTitleBox)
     title = f"{resolved_code} - {ts_name}" if ts_name else f"{resolved_code}"
-
-    font_path = _find_chinese_font()
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        import cv2 as _cv
-        font_size = max(18, min(36, H // 25))
-        # Try loading a CJK-capable font; handle TTC index variants
-        font = None
-        if font_path:
-            try:
-                font = ImageFont.truetype(font_path, font_size)
-            except Exception:
-                for idx in range(5):
-                    try:
-                        font = ImageFont.truetype(font_path, font_size, index=idx)
-                        break
-                    except Exception:
-                        continue
-        if font is None:
-            font = ImageFont.load_default()
-
-        rgb = _cv.cvtColor(img, _cv.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb)
-        draw = ImageDraw.Draw(pil_img)
-        # Use textbbox for wider Pillow compatibility
-        bbox = draw.textbbox((0, 0), title, font=font)
-        tw = int(bbox[2] - bbox[0])
-        th = int(bbox[3] - bbox[1])
-        # Center horizontally; move to very top vertically
-        tx = max(left_margin, int((W - tw) / 2))
-        ty = 2
-        # White title text for dark background
-        draw.text((tx, ty), title, font=font, fill=(255, 255, 255))
-        img = _cv.cvtColor(np.array(pil_img), _cv.COLOR_RGB2BGR)
-        title_box = (tx, ty - th, tx + tw, ty + th)
-    except Exception:
-        # Fallback: OpenCV cannot render CJK reliably; keep ASCII-only if PIL unavailable
-        font_title = cv2.FONT_HERSHEY_SIMPLEX
-        title_scale = max(0.6, min(1.0, H / 700))
-        (tw, th), _ = cv2.getTextSize(title, font_title, title_scale, 2)
-        tx = max(left_margin, int((W - tw) / 2))
-        # Baseline just below the very top
-        ty = th + 2
-        # White title text for dark background
-        cv2.putText(img, title, (tx, ty), font_title, title_scale, (255, 255, 255), 2, cv2.LINE_AA)
-        title_box = (tx, ty - th, tx + tw, ty)
+    title_box = None
 
     # axes
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -836,11 +1061,20 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
     num_xticks = min(10, n)
     idxs = np.linspace(0, n - 1, num_xticks)
     idxs = np.unique(np.clip(np.round(idxs).astype(int), 0, n - 1))
+    # Read timeframe from config to format labels
+    try:
+        _cfg = cfg_util.read_config()
+        ts_data_type = str(_cfg.get('ts_data_type', '2')).strip()
+    except Exception:
+        ts_data_type = '2'
     for i in idxs:
         x = int(xs[i])
         cv2.line(img, (x, H - bottom_margin), (x, H - bottom_margin + 6), color_axis, 1)
         dstr = str(rows[i][0])
-        if len(dstr) == 8:
+        # Minute view: show HH:MM from YYYYMMDDHHMM; Daily view: YY/MM/DD
+        if ts_data_type == '1' and len(dstr) >= 12:
+            label = f"{dstr[8:10]}:{dstr[10:12]}"
+        elif len(dstr) == 8:
             label = f"{dstr[2:4]}/{dstr[4:6]}/{dstr[6:8]}"
         else:
             label = dstr
@@ -1037,10 +1271,61 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
             except Exception:
                 pass
             # Legend
-            cv2.putText(img, "OBV", (left_margin + 4, obv_top + 15), font, font_scale, (80, 80, 80), 1, cv2.LINE_AA)
+            cv2.putText(img, "OBV divergence", (left_margin + 4, obv_top + 15), font, font_scale, (80, 80, 80), 1, cv2.LINE_AA)
             # Expose OBV for hover tooltip
             obv_vals = obv.tolist()
             obv_ma20_vals = obv_ma20.tolist()
+        except Exception:
+            pass
+
+    # Prepare container for RSI values for hover/return
+    rsi_vals_out = None
+
+    # --- RSI(14) subplot ---
+    if draw_rsi and rsi_top is not None and rsi_bottom is not None:
+        try:
+            if pre_rsi is not None and isinstance(pre_rsi, list) and len(pre_rsi) == n:
+                rsi_vals = np.array(pre_rsi, dtype=float)
+            else:
+                # Compute RSI(14) using Wilder smoothing
+                s_close = pd.Series(closes, dtype=float)
+                delta = s_close.diff()
+                gain = delta.clip(lower=0)
+                loss = -delta.clip(upper=0)
+                avg_gain = gain.ewm(alpha=1/14.0, adjust=False).mean()
+                avg_loss = loss.ewm(alpha=1/14.0, adjust=False).mean()
+                rs = avg_gain / avg_loss
+                rsi_vals = (100.0 - (100.0 / (1.0 + rs))).to_numpy()
+            # Expose RSI values to return dict
+            try:
+                rsi_vals_out = rsi_vals.tolist()
+            except Exception:
+                rsi_vals_out = None
+            # Scale 0-100
+            rsi_min, rsi_max = 0.0, 100.0
+            y_rsi = rsi_top + (rsi_max - rsi_vals) * (rsi_bottom - rsi_top) / (rsi_max - rsi_min)
+            # Panel box
+            cv2.rectangle(img, (left_margin, rsi_top), (W - right_margin, rsi_bottom), (50, 50, 50), 1)
+            # Guide lines at 30 and 70
+            y30 = int(rsi_top + (rsi_max - 30.0) * (rsi_bottom - rsi_top) / (rsi_max - rsi_min))
+            y70 = int(rsi_top + (rsi_max - 70.0) * (rsi_bottom - rsi_top) / (rsi_max - rsi_min))
+            cv2.line(img, (left_margin, y30), (W - right_margin, y30), (80, 80, 80), 1, lineType=cv2.LINE_AA)
+            cv2.line(img, (left_margin, y70), (W - right_margin, y70), (80, 80, 80), 1, lineType=cv2.LINE_AA)
+            # Right-side tick marks and labels for 30 and 70
+            try:
+                for val, yv in [(30, y30), (70, y70)]:
+                    cv2.line(img, (W - right_margin - 6, yv), (W - right_margin, yv), (50, 50, 50), 1)
+                    label = str(val)
+                    (tw_v, th_v), _ = cv2.getTextSize(label, font, font_scale, 1)
+                    x_text_v = min(W - tw_v - 5, W - right_margin + 10)
+                    cv2.putText(img, label, (x_text_v, yv + th_v // 2), font, font_scale, (200, 200, 200), 1, cv2.LINE_AA)
+            except Exception:
+                pass
+            # RSI line (orange-ish)
+            pts_rsi = np.column_stack((xs, y_rsi)).astype(np.int32)
+            cv2.polylines(img, [pts_rsi], False, (0, 160, 255), 1, lineType=cv2.LINE_AA)
+            # Legend
+            cv2.putText(img, "RSI(14) Bottom Top", (left_margin + 4, rsi_top + 15), font, font_scale, (80, 80, 80), 1, cv2.LINE_AA)
         except Exception:
             pass
 
@@ -1068,6 +1353,7 @@ def render_price_plot(price_data, width=1000, height=400, view=None, ma_flags=No
         "k": k_vals.tolist() if k_vals is not None else None,
         "d": d_vals.tolist() if d_vals is not None else None,
         "j": j_vals.tolist() if j_vals is not None else None,
+        "rsi14": rsi_vals_out if rsi_vals_out is not None else (pre_rsi if (pre_rsi is not None and isinstance(pre_rsi, list)) else None),
         "obv": obv_vals if obv_vals is not None else None,
         "obv_ma20": obv_ma20_vals if obv_ma20_vals is not None else None,
         "left_margin": left_margin,

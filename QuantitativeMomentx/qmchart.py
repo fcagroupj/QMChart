@@ -14,8 +14,13 @@
 #       MACD subplot, DIF, DEA.
 #       KDJ subplot, K, D, J.
 #       golden cross (green), dead cross (red)
-#       schema 1, show green triangle for Stock buy points, show red triangle for Stock sell points
-#       schema 2, QM subplot shows QM data  
+#       schema1, show green triangle for Stock buy points, based on MACD, DIF crossing DEA, and only when price is above MA114, 
+#               Show red triangle for Stock sell points when price is below MA114. Check https://www.youtube.com/watch?v=K2u31j4R7-s&t=979s. 
+#       schema2, QM subplot shows QM data  
+#       schema3, show buy/sell points based on OBV volume indicator, check https://www.youtube.com/watch?v=4YXQRdLFYNc
+#                draw red flags for bearish and green for bullish divergences
+#       schema4, check the stock bottom with RSI Oversold Bounce, show blue triangle if it's bottom
+#               Draw the stock top with RSI Overbought Reversal, show orange triangle if it's top
 
 import config_util as cfg_util
 import cv2
@@ -27,12 +32,24 @@ from tkinter import simpledialog
 import threading
 import Quant_db_helper01 as qdb01  
 import Quant_db_helper11 as qdb11  
+import Quant_db_helper14 as qdb14  
 import Quant_db_helper15 as qdb15  
-from Quant_db_helper21 import render_price_plot
-from Quant_db_helper23 import load_price_data, reader_thread
+from Quant_db_helper21 import render_price_plot, drawTitleBox
+from Quant_db_helper25 import load_ts_daily_db_data, reader_db_qm_thd
+from Quant_db_helper25 import delete_last_n_days
+from Quant_db_helper24 import load_ts_minute_db_data
 import Quant_algo11 as qalg11
 import time
 from datetime import datetime, timedelta
+try:
+    # Single-run update helpers (US/CN)
+    from Quant_db_helper15 import update_ticker_once as us_update_once
+except Exception:
+    us_update_once = None
+try:
+    from Quant_db_helper11 import update_ticker_once as cn_update_once
+except Exception:
+    cn_update_once = None
 
 def format_compact_number(v: float) -> str:
     try:
@@ -52,17 +69,14 @@ def format_compact_number(v: float) -> str:
 
 def main():
     cfg = cfg_util.read_config()
-    ts_stock_code = cfg.get('ts_stock_code', '301060.SZ')
+    ts_sk_code = cfg.get('ts_stock_code', '301060.SZ')
     ts_stock_type = cfg.get('ts_stock_type', 'cn')
+    ts_stock_code, resolved_name = cfg_util._resolve_ts_code(ts_sk_code)
     qdb01.init_db()
-    # Start updater thread
-    t1_updater_event = threading.Event()
-    t1_updater = None
-    if('us' ==  ts_stock_type):
-        t1_updater = threading.Thread(target=qdb15.updater_thread, args=(ts_stock_code, t1_updater_event))
-    else:
-        t1_updater = threading.Thread(target=qdb11.updater_thread, args=(ts_stock_code, t1_updater_event))
-    t1_updater.start()
+    # when data is changed, set value to trigger update in main loop
+    st_data_changed = 1
+    # When any event is changed, set value to trigger plotting update in main loop
+    st_view_changed = 1
     # get the maximum width and height from OS window size
     width, height = 1000, 600
     try:
@@ -75,8 +89,6 @@ def main():
             height = ctypes.windll.user32.GetSystemMetrics(1) - 80  # taskbar height
     except Exception:
         pass
-
-    price_data = load_price_data(ts_stock_code)
     # Moving-average toggle state (restored from config)
     def _on(val: str | None, default: str = '1') -> bool:
         v = (val if val is not None else default).strip().lower()
@@ -90,11 +102,14 @@ def main():
         114: _on(cfg.get('ma114')),
         'macd': _on(cfg.get('macd')),
         'kdj':  _on(cfg.get('kdj')),
+        'rsi':  _on(cfg.get('rsi'), default='0'),
+        'volume': _on(cfg.get('volume'), default='1'),
         'obv':  _on(cfg.get('obv'), default='0'),
         'cross': _on(cfg.get('cross')),
         'schema1': _on(cfg.get('schema1'), default='0'),
         'schema2': _on(cfg.get('schema2'), default='0'),
         'schema3': _on(cfg.get('schema3'), default='0'),
+        'schema4': _on(cfg.get('schema4'), default='0'),
     }
     # Tunables: drag sensitivity and Y-axis tick target
     try:
@@ -107,67 +122,59 @@ def main():
     except Exception:
         axis_yticks_target = 10
     axis_yticks_target = max(4, min(20, axis_yticks_target))
-    # Restore last view window from config if valid
+    # Restore last view window target from config if valid; actual data load happens in update_st_data_db
     init_view = None
-    if price_data is not None:
-        try:
-            vs_raw = (cfg.get('view_start') or '').strip()
-            ve_raw = (cfg.get('view_end') or '').strip()
-            vs = int(vs_raw) if vs_raw != '' else -1
-            ve = int(ve_raw) if ve_raw != '' else -1
-            total_n = len(price_data.get('rows', []))
-            if 0 <= vs <= ve < total_n:
-                init_view = (vs, ve)
-        except Exception:
-            init_view = None
-    plot = render_price_plot(price_data, width, height, view=init_view, ma_flags=ma_flags, tick_target=axis_yticks_target) if price_data is not None else None
+    price_data = None
+    # Initial rendering will be handled by update_st_view_plotting via st_view_changed
+    plot = None
+    if(True):
+        base = np.full((width, height, 3), 0, dtype=np.uint8)
+        xs, ys = None, None
+        # Initialize plotting series variables so nonlocal bindings exist
+        rows = None
+        dif = None
+        dea = None
+        k = None
+        d = None
+        j = None
+        rsi14 = None
+        obv = None
+        ma_data = None
+        W, H = base.shape[1], base.shape[0]
+        left_margin, right_margin, top_margin, bottom_margin = 0, 0, 0, 0
+        title_box = (833, -27, 1087, 31)
+        current_ticker =  ts_stock_code
+        hqm_score_val = qalg11.latest_hqm_score_for(current_ticker)
+        # Title is drawn only in update_st_view_plotting()
 
-    if plot is not None:
-        base = plot["img"]
-        xs = plot["xs"]
-        ys = plot["ys"]
-        rows = plot["rows"]
-        dif = plot.get("dif")
-        dea = plot.get("dea")
-        k = plot.get("k")
-        d = plot.get("d")
-        j = plot.get("j")
-        obv = plot.get("obv")
-        ma_data = plot.get("ma")
-        # Full series info for zooming
-        full_rows = price_data["rows"][:]  # keep original full range
-        full_n = len(full_rows)
-        if init_view is not None:
-            view_start, view_end = init_view
-        else:
-            view_start = 0
-            view_end = full_n - 1
+            # Current ticker and HQM score
+        view_start, view_end = 0, 0
+        full_n = 0
+        full_rows = []
         # Drag/pan state
         dragging = False
         drag_start_x = 0
         drag_start_view_start = view_start
         drag_start_view_end = view_end
         last_shift = 0
-        left_margin = plot["left_margin"]
-        right_margin = plot["right_margin"]
-        top_margin = plot["top_margin"]
-        bottom_margin = plot["bottom_margin"]
-        W = plot["W"]
-        H = plot["H"]
-        title_box = plot.get("title_box", None)
         # QuantM clickable label state
         quantm_box = None
         t2_quantm_running = False
         t2_quantm_event = threading.Event()
         t2_quantm = None
+        # Background data loader thread (t3_loader) for minute/daily DB reads
+        t3_loader = None
         # Remember the last stock input dialog to avoid multiple Tk instances
         dlg_input_stock = None
 
-        # Current ticker and HQM score
-        current_ticker = plot.get("resolved_ticker", ts_stock_code)
-        hqm_score_val = qalg11.latest_hqm_score_for(current_ticker)
+        # --- Timeframe toggle state (1=1M active, 2=1D active) ---
+        try:
+            ts_data_typ = int(cfg.get('ts_data_type'))
+        except Exception:
+            ts_data_typ = 1
+        timeframe_boxes = {}
 
-        win_title = f"QMChart V1.0.42"
+        win_title = f"QMChart V1.0.45"
         cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
         try:
             cv2.resizeWindow(win_title, width, height)
@@ -200,8 +207,50 @@ def main():
                 text_color = (0, 0, 0)
             cv2.putText(img, label, (x1 + pad_x, y1 + th + pad_y - 2), font, scale, text_color, 2, cv2.LINE_AA)
 
-        # Initial draw of QuantM button on base
-        draw_quantm_label(base)
+        # Helper to draw "1M" and "1D" labels on top-left and record boxes
+        def draw_timeframe_labels(img):
+            nonlocal timeframe_boxes, ts_data_typ, left_margin, top_margin, W, H
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = max(0.6, min(1.0, H / 700))
+            pad_x, pad_y = 8, 6
+            gap = 6
+            # Text sizes
+            (tw_m, th_m), _ = cv2.getTextSize("1M", font, scale, 2)
+            (tw_d, th_d), _ = cv2.getTextSize("1D", font, scale, 2)
+            # Positions
+            x = max(5, left_margin + 6)
+            y = 1
+            # 1M box
+            x1m = x
+            y1m = y
+            x2m = x1m + tw_m + pad_x * 2
+            y2m = y1m + th_m + int(pad_y * 1.2)
+            # 1D box to the right
+            x1d = x2m + gap
+            y1d = y1m
+            x2d = x1d + tw_d + pad_x * 2
+            y2d = y1d + th_d + int(pad_y * 1.2)
+
+            # Active: green; Inactive: black
+            active_bg = (0, 180, 0)
+            inactive_bg = (0, 0, 0)
+            border = (120, 120, 120)
+            text_color = (255, 255, 255)
+
+            # 1M is active if ts_data_typ == 2
+            bg_1m = active_bg if ts_data_typ == 1 else inactive_bg
+            bg_1d = active_bg if ts_data_typ == 2 else inactive_bg
+
+            # Draw 1M
+            cv2.rectangle(img, (x1m, y1m), (x2m, y2m), bg_1m, -1)
+            cv2.rectangle(img, (x1m, y1m), (x2m, y2m), border, 1)
+            cv2.putText(img, "1M", (x1m + pad_x, y1m + th_m + pad_y - 2), font, scale, text_color, 2, cv2.LINE_AA)
+            # Draw 1D
+            cv2.rectangle(img, (x1d, y1d), (x2d, y2d), bg_1d, -1)
+            cv2.rectangle(img, (x1d, y1d), (x2d, y2d), border, 1)
+            cv2.putText(img, "1D", (x1d + pad_x, y1d + th_d + pad_y - 2), font, scale, text_color, 2, cv2.LINE_AA)
+
+            timeframe_boxes = {'1M': (x1m, y1m, x2m, y2m), '1D': (x1d, y1d, x2d, y2d)}
 
         # --- Right-click Moving Average menu state ---
         ma_menu_visible = False
@@ -214,7 +263,7 @@ def main():
             nonlocal ma_menu_box, ma_item_boxes
             pad_x, pad_y = 10, 8
             item_h = 24
-            items = [5, 10, 20, 30, 60, 114, 'macd', 'kdj', 'obv', 'cross', 'schema1', 'schema2', 'schema3']
+            items = [5, 10, 20, 30, 60, 114, 'macd', 'kdj', 'rsi', 'volume', 'obv', 'cross', 'schema1', 'schema2', 'schema3', 'schema4']
             width_box = 180
             height_box = pad_y*2 + item_h*len(items) + 22
             x1, y1, x2, y2 = x, y, x + width_box, y + height_box
@@ -255,6 +304,28 @@ def main():
                         cv2.line(img, (sample_x1+1, sample_y1+2), (sample_x2-1, sample_y2-2), (200,0,200), 1, cv2.LINE_AA)   # D
                         cv2.line(img, (sample_x1+1, (sample_y1+sample_y2)//2), (sample_x2-1, (sample_y1+sample_y2)//2 + 1), (120,120,120), 1, cv2.LINE_AA)  # J
                         cv2.putText(img, "KDJ", (x1+70, iy+4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30,30,30), 1, cv2.LINE_AA)
+                    elif w == 'rsi':
+                        # RSI sample: center line with 30/70 guides and a small zigzag
+                        cv2.rectangle(img, (sample_x1, sample_y1), (sample_x2, sample_y2), (230,230,230), 1)
+                        mid = (sample_y1 + sample_y2)//2
+                        y30 = sample_y1 + int((sample_y2 - sample_y1) * 0.7)
+                        y70 = sample_y1 + int((sample_y2 - sample_y1) * 0.3)
+                        cv2.line(img, (sample_x1+1, y30), (sample_x2-1, y30), (80,80,80), 1, cv2.LINE_AA)
+                        cv2.line(img, (sample_x1+1, y70), (sample_x2-1, y70), (80,80,80), 1, cv2.LINE_AA)
+                        pts = np.array([[sample_x1+2, mid+3], [sample_x1+10, mid-3], [sample_x2-2, mid+2]], dtype=np.int32)
+                        cv2.polylines(img, [pts], False, (0,160,255), 1, cv2.LINE_AA)
+                        cv2.putText(img, "RSI", (x1+70, iy+4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30,30,30), 1, cv2.LINE_AA)
+                    elif w == 'volume':
+                        # Volume sample: tiny bar/cylinder below baseline
+                        cv2.rectangle(img, (sample_x1, sample_y1), (sample_x2, sample_y2), (230,230,230), 1)
+                        my = (sample_y1 + sample_y2)//2
+                        bx = (sample_x1 + sample_x2)//2
+                        cv2.rectangle(img, (bx-6, my+2), (bx+6, sample_y2-2), (0,150,0), -1)
+                        try:
+                            cv2.ellipse(img, (bx, my+2), (6, 3), 0, 0, 360, (120,240,120), -1, lineType=cv2.LINE_AA)
+                        except Exception:
+                            pass
+                        cv2.putText(img, "Volume", (x1+70, iy+4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30,30,30), 1, cv2.LINE_AA)
                     elif w == 'obv':
                         # OBV sample: simple small line representation (blue)
                         cv2.rectangle(img, (sample_x1, sample_y1), (sample_x2, sample_y2), (230,230,230), 1)
@@ -294,6 +365,194 @@ def main():
                         pts = np.array([[pole_x, my-8], [pole_x+10, my-4], [pole_x, my]], dtype=np.int32)
                         cv2.fillConvexPoly(img, pts, (0,150,0), lineType=cv2.LINE_AA)
                         cv2.putText(img, "schema 3", (x1+70, iy+4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30,30,30), 1, cv2.LINE_AA)
+                    elif w == 'schema4':
+                        # Schema 4 sample: bottom marker triangle under price
+                        cv2.rectangle(img, (sample_x1, sample_y1), (sample_x2, sample_y2), (230,230,230), 1)
+                        base_y = sample_y2 - 3
+                        cx = (sample_x1 + sample_x2)//2
+                        tri = np.array([[cx, base_y-8], [cx-8, base_y], [cx+8, base_y]], dtype=np.int32)
+                        cv2.fillConvexPoly(img, tri, (255, 128, 0), lineType=cv2.LINE_AA)
+                        cv2.putText(img, "schema 4", (x1+70, iy+4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30,30,30), 1, cv2.LINE_AA)
+        # Schedule data load in a background thread and trigger view refresh on completion
+        def update_st_data_db():
+            nonlocal price_data, full_rows, full_n, view_start, view_end, init_view
+            nonlocal st_view_changed, ts_stock_code, ts_data_typ, t3_loader
+            # If a previous loader is still running, wait briefly for it to finish to avoid overlap
+            try:
+                if t3_loader is not None and t3_loader.is_alive():
+                    try:
+                        t3_loader.join(timeout=0.2)
+                    except Exception:
+                        pass
+                # Define loader target
+                def _t3_load_and_refresh():
+                    nonlocal price_data, full_rows, full_n, view_start, view_end, init_view
+                    nonlocal st_view_changed, ts_stock_code, ts_data_typ
+                    try:
+                        # Decide timeframe and load from DB
+                        if ts_data_typ == 1:
+                            new_price_data = load_ts_minute_db_data(ts_stock_code)
+                        else:
+                            new_price_data = load_ts_daily_db_data(ts_stock_code)
+
+                        if not isinstance(new_price_data, dict):
+                            return
+
+                        # Assign new data
+                        price_data = new_price_data
+                        full_rows = price_data.get('rows', [])[:]
+                        full_n = len(full_rows)
+
+                        # Compute initial view from config if valid
+                        init_view = None
+                        try:
+                            vs_raw = (cfg.get('view_start') or '').strip()
+                            ve_raw = (cfg.get('view_end') or '').strip()
+                            vs = int(vs_raw) if vs_raw != '' else -1
+                            ve = int(ve_raw) if ve_raw != '' else -1
+                            if 0 <= vs <= ve < full_n:
+                                init_view = (vs, ve)
+                        except Exception:
+                            init_view = None
+
+                        if init_view is not None:
+                            view_start, view_end = init_view
+                        else:
+                            view_start = 0
+                            view_end = max(0, full_n - 1)
+
+                        # Trigger plotting update after data refresh
+                        st_view_changed += 1
+                    except Exception:
+                        # Best-effort: ignore loader exceptions to avoid crashing UI loop
+                        pass
+                # Start new loader thread
+                t3_loader = threading.Thread(target=_t3_load_and_refresh, name="t3_loader")
+                t3_loader.daemon = True
+                t3_loader.start()
+            except Exception:
+                pass
+
+        # Helper to (re)start the background data updater thread based on timeframe
+        def restart_t1_updater():
+            nonlocal t1_updater, t1_updater_event, current_ticker, ts_data_typ, ts_stock_type
+            nonlocal st_data_changed, st_view_changed
+            # Callback to mark data/view changed when minute updater inserts rows
+            def _t1_minute_data():
+                nonlocal st_data_changed, st_view_changed
+                st_data_changed = 1
+                # st_view_changed = 1
+            try:
+                # Stop existing updater if running
+                if t1_updater is not None and t1_updater.is_alive():
+                    t1_updater_event.set()
+                    for _ in range(200):
+                        if not t1_updater.is_alive():
+                            break
+                        time.sleep(0.05)
+                # Start a new updater with a fresh event
+                t1_updater_event = threading.Event()
+                if ('us' == ts_stock_type):
+                    if ts_data_typ == 1:
+                        t1_updater = threading.Thread(target=qdb14.updater_minute_thd, args=(current_ticker, t1_updater_event, "abc"), kwargs={'on_update': _t1_minute_data})
+                        t1_updater.start()
+                    else:
+                        # Prefer single-run update to avoid full-loop spam
+                        def _us_once():
+                            try:
+                                if callable(us_update_once):
+                                    us_update_once(current_ticker)
+                                else:
+                                    # Fallback to full updater for current ticker only
+                                    qdb15.updater_daily_thd(current_ticker, threading.Event(), on_update=_t1_minute_data)
+                            except Exception:
+                                pass
+                            # Trigger reload after update
+                            _t1_minute_data()
+                        t1_updater = threading.Thread(target=_us_once, name="us_update_once")
+                        t1_updater.daemon = True
+                        t1_updater.start()
+                else:
+                    if ts_data_typ == 1:
+                        # Minute for CN not defined; no-op
+                        pass
+                    else:
+                        def _cn_once():
+                            try:
+                                if callable(cn_update_once):
+                                    cn_update_once(current_ticker)
+                                else:
+                                    qdb11.updater_daily_thd(current_ticker, threading.Event(), on_update=_t1_minute_data)
+                            except Exception:
+                                pass
+                            _t1_minute_data()
+                        t1_updater = threading.Thread(target=_cn_once, name="cn_update_once")
+                        t1_updater.daemon = True
+                        t1_updater.start()
+            except Exception:
+                pass
+        # Centralized updater: render once and parse results into UI state, then redraw overlays
+        def update_st_view_plotting():
+            nonlocal base, xs, ys, rows, dif, dea, k, d, j, rsi14, obv, ma_data
+            nonlocal left_margin, right_margin, top_margin, bottom_margin, W, H, title_box
+            nonlocal win_title, ts_stock_code, resolved_name
+            nonlocal view_start, view_end
+            try:
+                # 1) Prepare base image and plotting state
+                tt = None
+                if price_data is None:
+                    # No data available: keep current base size and set minimal margins
+                    try:
+                        H, W = base.shape[0], base.shape[1]
+                    except Exception:
+                        H, W = 600, 1000
+                    left_margin = max(2, left_margin or 2)
+                    right_margin = max(0, right_margin or 0)
+                    top_margin = max(0, top_margin or 0)
+                    bottom_margin = max(0, bottom_margin or 0)
+                else:
+                    new_plot = render_price_plot(
+                        price_data, width, height,
+                        view=(view_start, view_end),
+                        ma_flags=ma_flags,
+                        persist_view=False,
+                        tick_target=axis_yticks_target
+                    )
+                    if new_plot is None:
+                        return
+                    base = new_plot["img"]
+                    xs = new_plot["xs"]
+                    ys = new_plot["ys"]
+                    rows = new_plot["rows"]
+                    dif = new_plot.get("dif")
+                    dea = new_plot.get("dea")
+                    k = new_plot.get("k")
+                    d = new_plot.get("d")
+                    j = new_plot.get("j")
+                    rsi14 = new_plot.get("rsi14")
+                    obv = new_plot.get("obv")
+                    ma_data = new_plot.get("ma")
+                    left_margin = new_plot["left_margin"]
+                    right_margin = new_plot["right_margin"]
+                    top_margin = new_plot["top_margin"]
+                    bottom_margin = new_plot["bottom_margin"]
+                    W = new_plot["W"]
+                    H = new_plot["H"]
+                    tt = new_plot.get("title_text")
+
+                # 2) Single-pass overlays: title, QM label, timeframe, optional MA menu
+                title_text = str(tt or (f"{ts_stock_code} - {resolved_name}" if resolved_name else ts_stock_code or "")).strip()
+                if not title_text:
+                    title_text = "set a stock"
+                base, title_box = drawTitleBox(base, title_text, left_margin)
+                draw_quantm_label(base)
+                draw_timeframe_labels(base)
+                overlay = base.copy()
+                if ma_menu_visible and ma_menu_pos:
+                    draw_ma_menu(overlay, x=ma_menu_pos[0], y=ma_menu_pos[1])
+                cv2.imshow(win_title, overlay)
+            except Exception:
+                pass
 
         # Mouse callback to draw crosshair and show date/price
         def on_mouse(event, x, y, flags, userdata):
@@ -304,9 +563,44 @@ def main():
             nonlocal quantm_box, t2_quantm_running, t2_quantm, t2_quantm_event
             nonlocal price_data, ma_menu_visible, ma_menu_pos
             nonlocal dlg_input_stock
-            nonlocal dif, dea, k, d, j, obv, ma_data
+            nonlocal dif, dea, k, d, j, rsi14, obv, ma_data
             nonlocal current_ticker, hqm_score_val
-            overlay = base.copy()
+            nonlocal timeframe_boxes, ts_data_typ
+            nonlocal st_view_changed, st_data_changed
+            nonlocal t1_updater, t1_updater_event
+            
+
+            # Click timeframe labels first
+            if event == cv2.EVENT_LBUTTONDOWN and timeframe_boxes:
+                def _hit(box):
+                    x1, y1, x2, y2 = box
+                    return x1 <= x <= x2 and y1 <= y <= y2
+                if _hit(timeframe_boxes.get('1M', (0,0,0,0))) and ts_data_typ != 1:
+                    ts_data_typ = 1
+                    try:
+                        cfg_util.write_config({'ts_data_type': '1'})
+                    except Exception:
+                        pass
+                    draw_timeframe_labels(base)
+                    # Reload data for new timeframe
+                    st_data_changed = 1
+                    # Restart background updater to minute
+                    restart_t1_updater()
+                    cv2.imshow(win_title, base)
+                    return
+                if _hit(timeframe_boxes.get('1D', (0,0,0,0))) and ts_data_typ != 2:
+                    ts_data_typ = 2
+                    try:
+                        cfg_util.write_config({'ts_data_type': '2'})
+                    except Exception:
+                        pass
+                    draw_timeframe_labels(base)
+                    # Reload data for new timeframe
+                    st_data_changed = 1
+                    # Restart background updater to daily
+                    restart_t1_updater()
+                    cv2.imshow(win_title, base)
+                    return
             # Right-click: toggle MA menu
             # Right-click: toggle MA menu at click position
             if event == cv2.EVENT_RBUTTONDOWN:
@@ -314,14 +608,15 @@ def main():
                 if ma_menu_visible:
                     # Clamp the menu position so it stays within window bounds
                     menu_w = 180
-                    # reflect new item count (6 MAs + MACD + KDJ + OBV + Cross + schema1 + schema2 + schema3)
-                    menu_h = 10 + 24*13 + 22
+                    # reflect new item count (6 MAs + MACD + KDJ + Volume + OBV + Cross + schema1 + schema2 + schema3)
+                    menu_h = 10 + 24*14 + 22
                     mx = max(5, min(x, W - menu_w - 5))
                     my = max(5, min(y, H - menu_h - 5))
                     ma_menu_pos = (mx, my)
+                    overlay = base.copy()
                     draw_ma_menu(overlay, x=ma_menu_pos[0], y=ma_menu_pos[1])
-                # Ensure QM label stays on top of overlays
-                cv2.imshow(win_title, overlay)
+                    # Ensure QM label stays on top of overlays
+                    cv2.imshow(win_title, overlay)
                 return
 
             # If MA menu visible, handle clicks to toggle items
@@ -351,6 +646,11 @@ def main():
                                 if w == 'schema3' and not ma_flags.get('schema3', False):
                                     ma_flags[20] = False
                                     ma_flags['obv'] = False
+                                # If schema4 is toggled, mirror RSI panel visibility
+                                if w == 'schema4' and ma_flags.get('schema4', False):
+                                    ma_flags['rsi'] = True
+                                if w == 'schema4' and not ma_flags.get('schema4', False):
+                                    ma_flags['rsi'] = False
                                 # Persist Plot Options to config
                                 try:
                                     cfg_util.write_config({
@@ -362,57 +662,37 @@ def main():
                                         'ma114': '1' if ma_flags.get(114, False) else '0',
                                         'macd': '1' if ma_flags.get('macd', False) else '0',
                                         'kdj':  '1' if ma_flags.get('kdj', False) else '0',
+                                        'rsi':  '1' if ma_flags.get('rsi', False) else '0',
+                                        'volume': '1' if ma_flags.get('volume', False) else '0',
                                         'obv':  '1' if ma_flags.get('obv', False) else '0',
                                         'cross': '1' if ma_flags.get('cross', False) else '0',
                                         'schema1': '1' if ma_flags.get('schema1', False) else '0',
                                         'schema2': '1' if ma_flags.get('schema2', False) else '0',
                                         'schema3': '1' if ma_flags.get('schema3', False) else '0',
+                                        'schema4': '1' if ma_flags.get('schema4', False) else '0',
+                                        'schema5': '1' if ma_flags.get('schema5', False) else '0',
                                     })
                                 except Exception:
                                     pass
-                                # Redraw plot with updated flags
-                                new_plot = render_price_plot(price_data, width, height, view=(view_start, view_end), ma_flags=ma_flags, tick_target=axis_yticks_target)
-                                if new_plot is not None:
-                                    base = new_plot["img"]
-                                    xs = new_plot["xs"]
-                                    ys = new_plot["ys"]
-                                    rows = new_plot["rows"]
-                                    dif = new_plot.get("dif")
-                                    dea = new_plot.get("dea")
-                                    k = new_plot.get("k")
-                                    d = new_plot.get("d")
-                                    j = new_plot.get("j")
-                                    obv = new_plot.get("obv")
-                                    ma_data = new_plot.get("ma")
-                                    left_margin = new_plot["left_margin"]
-                                    right_margin = new_plot["right_margin"]
-                                    top_margin = new_plot["top_margin"]
-                                    bottom_margin = new_plot["bottom_margin"]
-                                    W = new_plot["W"]
-                                    H = new_plot["H"]
-                                    title_box = new_plot.get("title_box", None)
-                                    draw_quantm_label(base)
-                                    overlay = base.copy()
-                                    if ma_menu_pos:
-                                        draw_ma_menu(overlay, x=ma_menu_pos[0], y=ma_menu_pos[1])
-                                    cv2.imshow(win_title, overlay)
-                                    return
+                                # Trigger centralized update
+                                st_view_changed += 1
+                                return
                 # click outside closes menu
                 ma_menu_visible = False
                 cv2.imshow(win_title, base)
                 return
             # Click on title to edit stock code
             if event == cv2.EVENT_LBUTTONDOWN and title_box is not None:
+                # Destroy previous dialog if it exists
+                if dlg_input_stock is not None:
+                    try:
+                        dlg_input_stock.destroy()
+                    except Exception:
+                        pass
+                    dlg_input_stock = None
                 x1, y1, x2, y2 = title_box
                 if x1 <= x <= x2 and y1 <= y <= y2:
                     try:
-                        # Destroy previous dialog if it exists
-                        if dlg_input_stock is not None:
-                            try:
-                                dlg_input_stock.destroy()
-                            except Exception:
-                                pass
-                            dlg_input_stock = None
                         dlg_input_stock = tk.Tk()
                         dlg_input_stock.withdraw()
                         new_code = simpledialog.askstring(
@@ -431,44 +711,19 @@ def main():
                     if new_code is not None:
                         new_code = new_code.strip()
                     if new_code:
-                        new_price_data = load_price_data(new_code)
-                        new_plot = render_price_plot(new_price_data, width, height, ma_flags=ma_flags, tick_target=axis_yticks_target) if new_price_data is not None else None
-                        if new_plot is not None:
-                            # Update state
-                            ts_stock_code = new_code
-                            try:
-                                cfg_util.write_config({'ts_stock_code': ts_stock_code})
-                            except Exception:
-                                pass
-                            base = new_plot["img"]
-                            xs = new_plot["xs"]
-                            ys = new_plot["ys"]
-                            rows = new_plot["rows"]
-                            dif = new_plot.get("dif")
-                            dea = new_plot.get("dea")
-                            k = new_plot.get("k")
-                            d = new_plot.get("d")
-                            j = new_plot.get("j")
-                            obv = new_plot.get("obv")
-                            ma_data = new_plot.get("ma")
-                            # Reset zoom state to full using loaded data
-                            price_data = new_price_data
-                            full_rows = price_data["rows"][:]
-                            full_n = len(full_rows)
-                            view_start = 0
-                            view_end = max(0, full_n - 1)
-                            left_margin = new_plot["left_margin"]
-                            right_margin = new_plot["right_margin"]
-                            top_margin = new_plot["top_margin"]
-                            bottom_margin = new_plot["bottom_margin"]
-                            W = new_plot["W"]
-                            H = new_plot["H"]
-                            title_box = new_plot.get("title_box", None)
-                            # Refresh ticker and HQM score
-                            current_ticker = new_plot.get("resolved_ticker", ts_stock_code)
-                            hqm_score_val = qalg11.latest_hqm_score_for(current_ticker)
-                            draw_quantm_label(base)
-                            cv2.imshow(win_title, base)
+                        # Update state and trigger background data reload
+                        ts_stock_code, resolved_name = cfg_util._resolve_ts_code(new_code)
+                        try:
+                            cfg_util.write_config({'ts_stock_code': ts_stock_code})
+                        except Exception:
+                            pass
+                        # Refresh ticker and HQM score
+                        current_ticker = ts_stock_code
+                        hqm_score_val = qalg11.latest_hqm_score_for(current_ticker)
+                        # Request data reload
+                        st_data_changed = 1
+                        # Restart background updater to minute
+                        restart_t1_updater()
                         return
             # Click on QuantM to start background reader thread
             if event == cv2.EVENT_LBUTTONDOWN and quantm_box is not None:
@@ -478,7 +733,7 @@ def main():
                         t2_quantm_running = True
                         # Start reader thread to build HQM dataframe
                         t2_quantm_event.clear()                        
-                        t2_quantm = threading.Thread(target=reader_thread, args=(None, t2_quantm_event), daemon=True)
+                        t2_quantm = threading.Thread(target=reader_db_qm_thd, args=(None, t2_quantm_event), daemon=True)
                         t2_quantm.start()
                         # Immediate visual feedback (red)
                         draw_quantm_label(base)
@@ -534,31 +789,10 @@ def main():
                         new_end = full_n - 1
                         if new_start < 0:
                             new_start = 0
-                    # Re-render view
-                    new_plot = render_price_plot(price_data, width, height, view=(new_start, new_end), ma_flags=ma_flags, persist_view=False, tick_target=axis_yticks_target)
-                    if new_plot is not None:
-                        base = new_plot["img"]
-                        xs = new_plot["xs"]
-                        ys = new_plot["ys"]
-                        rows = new_plot["rows"]
-                        dif = new_plot.get("dif")
-                        dea = new_plot.get("dea")
-                        k = new_plot.get("k")
-                        d = new_plot.get("d")
-                        j = new_plot.get("j")
-                        obv = new_plot.get("obv")
-                        ma_data = new_plot.get("ma")
-                        left_margin = new_plot["left_margin"]
-                        right_margin = new_plot["right_margin"]
-                        top_margin = new_plot["top_margin"]
-                        bottom_margin = new_plot["bottom_margin"]
-                        W = new_plot["W"]
-                        H = new_plot["H"]
-                        title_box = new_plot.get("title_box", None)
-                        view_start, view_end = new_start, new_end
-                        last_shift = shift
-                        draw_quantm_label(base)
-                        cv2.imshow(win_title, base)
+                    # Update view state and trigger centralized update
+                    view_start, view_end = new_start, new_end
+                    last_shift = shift
+                    st_view_changed += 1
                 return
 
             # Mouse wheel zoom around current mouse position
@@ -580,7 +814,7 @@ def main():
                     new_len = int(round(L * factor))
                     new_len = max(min_len, min(max_len, new_len))
                     if new_len == L:
-                        pass
+                        pass # print("Zoom limit reached", factor, min_len, max_len, new_len)
                     else:
                         # Keep relative position in view
                         r = idx_view / float(L)
@@ -596,37 +830,18 @@ def main():
                             new_end = full_n - 1
                             if new_start < 0:
                                 new_start = 0
-                        # Apply zoom by re-rendering the plot for the slice (avoid frequent disk writes)
-                        new_plot = render_price_plot(price_data, width, height, view=(new_start, new_end), ma_flags=ma_flags, persist_view=False, tick_target=axis_yticks_target)
-                        if new_plot is not None:
-                            base = new_plot["img"]
-                            xs = new_plot["xs"]
-                            ys = new_plot["ys"]
-                            rows = new_plot["rows"]
-                            dif = new_plot.get("dif")
-                            dea = new_plot.get("dea")
-                            k = new_plot.get("k")
-                            d = new_plot.get("d")
-                            j = new_plot.get("j")
-                            obv = new_plot.get("obv")
-                            ma_data = new_plot.get("ma")
-                            left_margin = new_plot["left_margin"]
-                            right_margin = new_plot["right_margin"]
-                            top_margin = new_plot["top_margin"]
-                            bottom_margin = new_plot["bottom_margin"]
-                            W = new_plot["W"]
-                            H = new_plot["H"]
-                            title_box = new_plot.get("title_box", None)
-                            view_start, view_end = new_start, new_end
-                            draw_quantm_label(base)
-                            cv2.imshow(win_title, base)
-                            # Persist view range after zoom event
-                            try:
-                                cfg_util.write_config({'view_start': str(view_start), 'view_end': str(view_end)})
-                            except Exception:
-                                pass
+                        # Update view state and trigger centralized update
+                        view_start, view_end = new_start, new_end
+                        st_view_changed += 1
+                        # Persist view range after zoom event
+                        try:
+                            cfg_util.write_config({'view_start': str(view_start), 'view_end': str(view_end)})
+                        except Exception:
+                            pass
                 return
-            if left_margin <= x <= W - right_margin and top_margin <= y <= H - bottom_margin:
+            if event == cv2.EVENT_MOUSEMOVE and left_margin <= x <= W - right_margin and top_margin <= y <= H - bottom_margin:    
+                if(xs is None or ys is None or rows is None):
+                    return            
                 idx = int(np.argmin(np.abs(xs - x)))
                 px = int(xs[idx])
                 py = int(ys[idx])
@@ -637,7 +852,7 @@ def main():
                 except Exception:
                     price_val = price_raw
                 date_label = f"{dstr[2:4]}/{dstr[4:6]}/{dstr[6:8]}" if len(dstr) == 8 else dstr
-
+                overlay = base.copy()
                 # Crosshair lines
                 cv2.line(overlay, (x, top_margin), (x, H - bottom_margin), (180, 180, 180), 1, cv2.LINE_AA)
                 cv2.line(overlay, (left_margin, py), (W - right_margin, py), (180, 180, 180), 1, cv2.LINE_AA)
@@ -668,6 +883,11 @@ def main():
                         if dv is not None and ev is not None:
                             parts.append(f"DIF:{float(dv):.3f}")
                             parts.append(f"DEA:{float(ev):.3f}")
+                    # RSI value if RSI panel is toggled on
+                    if ma_flags.get('rsi', False) and rsi14 is not None and 0 <= idx < len(rsi14):
+                        rv = rsi14[idx]
+                        if rv is not None and not (isinstance(rv, float) and np.isnan(rv)):
+                            parts.append(f"RSI:{float(rv):.2f}")
                     # K/D/J if KDJ is toggled on
                     '''
                     if ma_flags.get('kdj', False) and k is not None and d is not None and j is not None and 0 <= idx < len(k) and 0 <= idx < len(d) and 0 <= idx < len(j):
@@ -713,12 +933,17 @@ def main():
                 cv2.rectangle(overlay, (bx - 5, by - th - 5), (bx + tw + 5, by + 5), (180, 180, 180), 1)
                 cv2.putText(overlay, label, (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 1, cv2.LINE_AA)
 
-            if ma_menu_visible and ma_menu_pos:
-                draw_ma_menu(overlay, x=ma_menu_pos[0], y=ma_menu_pos[1])
-            cv2.imshow(win_title, overlay)
+                if ma_menu_visible and ma_menu_pos:
+                    draw_ma_menu(overlay, x=ma_menu_pos[0], y=ma_menu_pos[1])
+                cv2.imshow(win_title, overlay)
 
         cv2.setMouseCallback(win_title, on_mouse)
-        cv2.imshow(win_title, base)
+        # Trigger the first update via st_view_changed; centralized updater will render
+        st_view_changed = 1
+        # Start updater thread
+        t1_updater_event = threading.Event()
+        t1_updater = None
+        restart_t1_updater()
         # Keyboard loop: handle '1'/'END' to anchor to end, '7'/'HOME' to anchor to start
         KEY_END = 2686976   # Windows HighGUI END key code (may not be detected)
         KEY_HOME = 2359296  # Windows HighGUI HOME key code (may vary)
@@ -732,9 +957,10 @@ def main():
         KEY_PGUP = 2162688   # Windows HighGUI PageUp key code (may vary)
         KEY_5 = ord('5')
         KEY_0 = ord('0')
+        KEY_BACKSPACE = 8  # Common Backspace code in HighGUI
 
         # Helper: stop QM thread cooperatively
-        def _stop_quantm():
+        def _t2_stop_quantm():
             nonlocal t2_quantm_running, t2_quantm_event, t2_quantm
             try:
                 if t2_quantm_running and t2_quantm is not None and t2_quantm.is_alive():
@@ -749,34 +975,10 @@ def main():
         
         # Helper: apply a new view range and update/persist UI
         def apply_view(new_start: int, new_end: int, persist: bool = True) -> bool:
-            nonlocal base, xs, ys, rows, dif, dea, k, d, j, obv, ma_data
-            nonlocal left_margin, right_margin, top_margin, bottom_margin, W, H, title_box
-            nonlocal view_start, view_end
+            nonlocal view_start, view_end, st_view_changed
             try:
-                new_plot = render_price_plot(price_data, width, height, view=(new_start, new_end), ma_flags=ma_flags, persist_view=False, tick_target=axis_yticks_target)
-                if new_plot is None:
-                    return False
-                base = new_plot["img"]
-                xs = new_plot["xs"]
-                ys = new_plot["ys"]
-                rows = new_plot["rows"]
-                dif = new_plot.get("dif")
-                dea = new_plot.get("dea")
-                k = new_plot.get("k")
-                d = new_plot.get("d")
-                j = new_plot.get("j")
-                obv = new_plot.get("obv")
-                ma_data = new_plot.get("ma")
-                left_margin = new_plot["left_margin"]
-                right_margin = new_plot["right_margin"]
-                top_margin = new_plot["top_margin"]
-                bottom_margin = new_plot["bottom_margin"]
-                W = new_plot["W"]
-                H = new_plot["H"]
-                title_box = new_plot.get("title_box", None)
                 view_start, view_end = new_start, new_end
-                draw_quantm_label(base)
-                cv2.imshow(win_title, base)
+                st_view_changed += 1
                 if persist:
                     try:
                         cfg_util.write_config({'view_start': str(view_start), 'view_end': str(view_end)})
@@ -896,14 +1098,21 @@ def main():
 
         def compute_full_view():
             return 0, max(0, full_n - 1)
+        # Once ST data is changed, plotting will be updated via update_st_view_plotting()
         while True:
+            if(st_data_changed > 0):
+                update_st_data_db()
+                st_data_changed = 0
+            if(st_view_changed > 0):
+                update_st_view_plotting()
+                st_view_changed = 0
             # Detect window close via title bar 'X' and stop QM thread
             try:
                 if cv2.getWindowProperty(win_title, cv2.WND_PROP_VISIBLE) < 1:
-                    _stop_quantm()
+                    _t2_stop_quantm()
                     break
             except Exception:
-                _stop_quantm()
+                _t2_stop_quantm()
                 break
             k = cv2.waitKey(20) & 0xFFFFFFFF
             if k == -1: continue
@@ -935,14 +1144,28 @@ def main():
                 # Show the full dataset range
                 new_start, new_end = compute_full_view()
                 apply_view(new_start, new_end, persist=True)
+            elif k == KEY_BACKSPACE:
+                # Backspace: when 1D view is active, delete last 10 days from DB for current ticker
+                try:
+                    if ts_data_typ == 2 and ts_stock_code:
+                        removed = delete_last_n_days(ts_stock_code, 10)
+                        if removed > 0:
+                            # Trigger immediate reload to reflect deletion
+                            st_data_changed = 1
+                            # Then ask updater to fetch latest rows for current ticker
+                            restart_t1_updater()
+                            print(f"[qmchart] Removed {removed} daily rows for {ts_stock_code} and requested updater fetch")
+                except Exception as e:
+                    print(f"[qmchart] Backspace deletion failed: {e}")
         cv2.destroyAllWindows()
         t1_updater_event.set()
         t1_updater.join()
         # Stop QuantM thread if running
         try:
-            _stop_quantm()
+            _t2_stop_quantm()
         except Exception:
             pass
+        t3_loader.join()
 
 if __name__ == "__main__":
     main()

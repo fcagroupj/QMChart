@@ -99,23 +99,15 @@ def _ensure_daily_price_table(conn):
     )
     conn.commit()
 
-def updater_thread(ts_code, stop_event):
+def updater_daily_thd(ts_code, stop_event, on_update=None):
     conn = sqlite3.connect(DB_PATH15, check_same_thread=False)
     _ensure_daily_price_table(conn)
     
     #Import list of stocks
     stocks_sp = get_stocks_set2()['Ticker']
     stock_i = int(_cfg.get('D_STOCK_UPDATING', "0"))   
-    print(f'-------------Updating LOOP 15 {{{stock_i}}}------------------')
+    print(f"[updater_daily_thd] updating LOOP 15 {{{stock_i}}}------------------")
     while not stop_event.is_set():
-        if(stock_i < len(stocks_sp)):
-            ts_code = stocks_sp[stock_i]
-            stock_i += 1
-        else:
-            stock_i = 0
-            ts_code = stocks_sp[stock_i]
-            print(f'-------------Updating LOOP 15 {{{stock_i}}}------------------')
-        if(stock_i % 10 == 0): cfg_util.write_config({'D_STOCK_UPDATING': str(stock_i)})
         last_date = get_last_trade_date(conn, ts_code)
 
         if last_date:
@@ -194,7 +186,11 @@ def updater_thread(ts_code, stop_event):
                         count += 1
                     conn.commit()
                     if count > 0:
-                        pass
+                        try:
+                            if callable(on_update):
+                                on_update()
+                        except Exception:
+                            pass
                         # cfg_util.o_status_line(f"Pulled {stock_i} / {len(stocks_sp)} stocks ... {ts_code} {start}->{end} rows:{count}")
             except Exception as e:
                 pass
@@ -204,6 +200,14 @@ def updater_thread(ts_code, stop_event):
             pass
             # print(f"AlreadyIs {stock_i} / {len(stocks_sp)} stocks ...", ts_code, start, end)
         time.sleep(D_MAX_SPEED)  # update every max time
+        if(stock_i < len(stocks_sp)):
+            ts_code = stocks_sp[stock_i]
+            stock_i += 1
+        else:
+            stock_i = 0
+            ts_code = stocks_sp[stock_i]
+            print(f"[updater_daily_thd] updating LOOP 15 {{{stock_i}}}------------------")
+        if(stock_i % 10 == 0): cfg_util.write_config({'D_STOCK_UPDATING': str(stock_i)})
 
     conn.close()
 
