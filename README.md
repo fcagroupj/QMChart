@@ -8,9 +8,13 @@ QMChart is Quantitative Momentum Chart visualization tool
 
 # Functions
 This script displays an interactive price chart for a specified stock using OpenCV.
+
 It supports zooming, panning, and toggling moving averages (MA).
+
 It also integrates with a background thread to update stock data.
+
 Clicking the "QM" label starts a background process to compute High Quality Momentum (HQM) scores.
+
 The stock code can be edited via a dialog box triggered by clicking the title.
      hover tooltip, showing date, price, and indicator values.
      Plot Options menu  
